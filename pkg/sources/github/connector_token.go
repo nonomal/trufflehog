@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	gogit "github.com/go-git/go-git/v5"
-	"github.com/google/go-github/v66/github"
+	"github.com/google/go-github/v67/github"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources/git"
@@ -22,15 +22,15 @@ type tokenConnector struct {
 	userMu             sync.Mutex
 }
 
-var _ connector = (*tokenConnector)(nil)
+var _ Connector = (*tokenConnector)(nil)
 
-func newTokenConnector(apiEndpoint string, token string, handleRateLimit func(context.Context, error) bool) (*tokenConnector, error) {
+func NewTokenConnector(apiEndpoint string, token string, handleRateLimit func(context.Context, error) bool) (Connector, error) {
 	const httpTimeoutSeconds = 60
 	httpClient := common.RetryableHTTPClientTimeout(int64(httpTimeoutSeconds))
 	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	httpClient.Transport = &oauth2.Transport{
 		Base:   httpClient.Transport,
-		Source: oauth2.ReuseTokenSource(nil, tokenSource),
+		Source: tokenSource,
 	}
 
 	apiClient, err := createGitHubClient(httpClient, apiEndpoint)
@@ -50,11 +50,11 @@ func (c *tokenConnector) APIClient() *github.Client {
 	return c.apiClient
 }
 
-func (c *tokenConnector) Clone(ctx context.Context, repoURL string) (string, *gogit.Repository, error) {
+func (c *tokenConnector) Clone(ctx context.Context, repoURL string, args ...string) (string, *gogit.Repository, error) {
 	if err := c.setUserIfUnset(ctx); err != nil {
 		return "", nil, err
 	}
-	return git.CloneRepoUsingToken(ctx, c.token, repoURL, c.user)
+	return git.CloneRepoUsingToken(ctx, c.token, repoURL, c.user, args...)
 }
 
 func (c *tokenConnector) IsGithubEnterprise() bool {

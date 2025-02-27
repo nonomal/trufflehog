@@ -5,12 +5,12 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/exp/slices"
 )
 
 func TestRetryableHTTPClientCheckRetry(t *testing.T) {
@@ -64,7 +64,6 @@ func TestRetryableHTTPClientCheckRetry(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var retryCount int
@@ -137,7 +136,6 @@ func TestRetryableHTTPClientMaxRetry(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var retryCount int
@@ -202,7 +200,6 @@ func TestRetryableHTTPClientBackoff(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 

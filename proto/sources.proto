@@ -51,6 +51,7 @@ enum SourceType {
   SOURCE_TYPE_HUGGINGFACE = 36;
   SOURCE_TYPE_GITHUB_EXPERIMENTAL = 37;
   SOURCE_TYPE_SENTRY = 38;
+  SOURCE_TYPE_GITHUB_REALTIME = 39;
 }
 
 message LocalSource {
@@ -219,6 +220,8 @@ message GitLab {
   repeated string ignore_repos = 6;
   bool skip_binaries = 7;
   bool skip_archives = 8;
+  repeated string include_repos = 9;
+  bool exclude_projects_shared_into_groups = 10;
 }
 
 message GitHub {
@@ -254,6 +257,18 @@ message GitHubExperimental {
   bool object_discovery = 3;
   int64 collision_threshold = 4;
   bool delete_cached_data = 5;
+}
+
+message GitHubRealtime {
+  uint32 listener_port = 1;
+  string webhook_secret = 2;
+  string endpoint = 3 [(validate.rules).string.uri_ref = true];
+  oneof credential {
+    credentials.GitHubApp github_app = 4;
+    string token = 5;
+    credentials.Unauthenticated unauthenticated = 6;
+    credentials.BasicAuth basic_auth = 7;
+  }
 }
 
 message GoogleDrive {
@@ -322,6 +337,7 @@ message S3 {
   int64 max_object_size = 6;
   repeated string roles = 7;
   repeated string ignore_buckets = 8;
+  bool enable_resumption = 9 [deprecated = true];
 }
 
 message Slack {

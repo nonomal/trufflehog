@@ -4,15 +4,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/giturl"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/log"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/source_metadatapb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/sourcespb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sanitizer"
@@ -22,7 +21,7 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/gobwas/glob"
 	"github.com/xanzy/go-gitlab"
-	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -38,13 +37,18 @@ type Source struct {
 	jobID    sources.JobID
 	verify   bool
 
-	authMethod  string
-	user        string
-	password    string
-	token       string
-	url         string
-	repos       []string
-	ignoreRepos []string
+	authMethod   string
+	user         string
+	password     string
+	token        string
+	url          string
+	repos        []string
+	ignoreRepos  []string
+	includeRepos []string
+
+	// This is an experimental flag used to investigate some suspicious behavior we've seen with very large GitLab
+	// organizations that have lots of group sharing.
+	enumerateSharedProjects bool
 
 	useCustomContentWriter bool
 	git                    *git.Git
@@ -81,6 +85,56 @@ func (s *Source) JobID() sources.JobID {
 	return s.jobID
 }
 
+// globRepoFilter is a wrapper around cache.Cache that filters out repos
+// based on include and exclude globs.
+type globRepoFilter struct {
+	include, exclude []glob.Glob
+}
+
+func newGlobRepoFilter(include, exclude []string, onCompileErr func(err error, pattern string)) *globRepoFilter {
+	includeGlobs := make([]glob.Glob, 0, len(include))
+	excludeGlobs := make([]glob.Glob, 0, len(exclude))
+	for _, ig := range include {
+		g, err := glob.Compile(ig)
+		if err != nil {
+			onCompileErr(err, ig)
+			continue
+		}
+		includeGlobs = append(includeGlobs, g)
+	}
+	for _, eg := range exclude {
+		g, err := glob.Compile(eg)
+		if err != nil {
+			onCompileErr(err, eg)
+			continue
+		}
+		excludeGlobs = append(excludeGlobs, g)
+	}
+	return &globRepoFilter{include: includeGlobs, exclude: excludeGlobs}
+}
+
+func (c *globRepoFilter) ignoreRepo(s string) bool {
+	for _, g := range c.exclude {
+		if g.Match(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *globRepoFilter) includeRepo(s string) bool {
+	if len(c.include) == 0 {
+		return true
+	}
+
+	for _, g := range c.include {
+		if g.Match(s) {
+			return true
+		}
+	}
+	return false
+}
+
 // Init returns an initialized Gitlab source.
 func (s *Source) Init(ctx context.Context, name string, jobId sources.JobID, sourceId sources.SourceID, verify bool, connection *anypb.Any, concurrency int) error {
 	s.name = name
@@ -100,17 +154,23 @@ func (s *Source) Init(ctx context.Context, name string, jobId sources.JobID, sou
 		return fmt.Errorf("error unmarshalling connection: %w", err)
 	}
 
-	s.repos = conn.Repositories
-	s.ignoreRepos = conn.IgnoreRepos
+	s.repos = conn.GetRepositories()
+	s.ignoreRepos = conn.GetIgnoreRepos()
+	s.includeRepos = conn.GetIncludeRepos()
+	s.enumerateSharedProjects = !conn.ExcludeProjectsSharedIntoGroups
+
 	ctx.Logger().V(3).Info("setting ignore repos patterns", "patterns", s.ignoreRepos)
+	ctx.Logger().V(3).Info("setting include repos patterns", "patterns", s.includeRepos)
 
 	switch cred := conn.GetCredential().(type) {
 	case *sourcespb.GitLab_Token:
 		s.authMethod = "TOKEN"
 		s.token = cred.Token
+		log.RedactGlobally(s.token)
 	case *sourcespb.GitLab_Oauth:
 		s.authMethod = "OAUTH"
 		s.token = cred.Oauth.RefreshToken
+		log.RedactGlobally(s.token)
 		// TODO: is it okay if there is no client id and secret? Might be an issue when marshalling config to proto
 	case *sourcespb.GitLab_BasicAuth:
 		s.authMethod = "BASIC_AUTH"
@@ -118,6 +178,7 @@ func (s *Source) Init(ctx context.Context, name string, jobId sources.JobID, sou
 		s.password = cred.BasicAuth.Password
 		// We may need the password as a token if the user is using an access_token with basic auth.
 		s.token = cred.BasicAuth.Password
+		log.RedactGlobally(cred.BasicAuth.Password)
 	default:
 		return fmt.Errorf("invalid configuration given for source %q (%s)", name, s.Type().String())
 	}
@@ -188,8 +249,8 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, tar
 	// Get all repos if not specified.
 	if len(repos) == 0 {
 		ctx.Logger().Info("no repositories configured, enumerating")
-		ignoreRepo := buildIgnorer(s.ignoreRepos, func(err error, pattern string) {
-			ctx.Logger().Error(err, "could not compile ignore repo glob", "glob", pattern)
+		ignoreRepo := buildIgnorer(s.includeRepos, s.ignoreRepos, func(err error, pattern string) {
+			ctx.Logger().Error(err, "could not compile include/exclude repo glob", "glob", pattern)
 		})
 		reporter := sources.VisitorReporter{
 			VisitUnit: func(ctx context.Context, unit sources.SourceUnit) error {
@@ -312,8 +373,8 @@ func (s *Source) Validate(ctx context.Context) []error {
 		return errs
 	}
 
-	ignoreProject := buildIgnorer(s.ignoreRepos, func(err error, pattern string) {
-		errs = append(errs, fmt.Errorf("could not compile ignore repo pattern %q: %w", pattern, err))
+	ignoreProject := buildIgnorer(s.includeRepos, s.ignoreRepos, func(err error, pattern string) {
+		errs = append(errs, fmt.Errorf("could not compile include/exclude repo pattern %q: %w", pattern, err))
 	})
 
 	// Query GitLab for the list of configured repos.
@@ -512,7 +573,6 @@ func (s *Source) getAllProjectRepos(
 	}
 
 	ctx.Logger().Info("got groups", "group_count", len(groups))
-	ctx.Logger().V(2).Info("got groups", "groups", groups)
 
 	for _, group := range groups {
 		ctx := context.WithValue(ctx, "group_id", group.ID)
@@ -520,6 +580,7 @@ func (s *Source) getAllProjectRepos(
 			ListOptions:      listOpts,
 			OrderBy:          gitlab.Ptr(orderBy),
 			IncludeSubGroups: gitlab.Ptr(true),
+			WithShared:       gitlab.Ptr(s.enumerateSharedProjects),
 		}
 		for {
 			grpPrjs, res, err := apiClient.Groups.ListGroupProjects(group.ID, listGroupProjectOptions)
@@ -545,7 +606,6 @@ func (s *Source) getAllProjectRepos(
 	}
 
 	ctx.Logger().Info("Enumerated GitLab projects", "count", len(projectsWithNamespace))
-	ctx.Logger().V(2).Info("Enumerated GitLab projects", "projects", projectsWithNamespace)
 
 	return nil
 }
@@ -558,7 +618,7 @@ func (s *Source) scanRepos(ctx context.Context, chunksChan chan *sources.Chunk) 
 	scanErrs := sources.NewScanErrors()
 
 	for i, repo := range s.repos {
-		i, repoURL := i, repo
+		repoURL := repo
 		s.jobPool.Go(func() error {
 			logger := ctx.Logger().WithValues("repo", repoURL)
 			if common.IsDone(ctx) {
@@ -629,7 +689,7 @@ func (s *Source) setProgressCompleteWithRepo(index int, offset int, repoURL stri
 
 	// Add the repoURL to the resume info slice.
 	s.resumeInfoSlice = append(s.resumeInfoSlice, repoURL)
-	sort.Strings(s.resumeInfoSlice)
+	slices.Sort(s.resumeInfoSlice)
 
 	// Make the resume info string from the slice.
 	encodedResumeInfo := sources.EncodeResumeInfo(s.resumeInfoSlice)
@@ -642,23 +702,14 @@ func (s *Source) WithScanOptions(scanOptions *git.ScanOptions) {
 	s.scanOptions = scanOptions
 }
 
-func buildIgnorer(patterns []string, onCompileErr func(err error, pattern string)) func(repo string) bool {
-	var globs []glob.Glob
+func buildIgnorer(include, exclude []string, onCompile func(err error, pattern string)) func(repo string) bool {
 
-	for _, pattern := range patterns {
-		g, err := glob.Compile(pattern)
-		if err != nil {
-			onCompileErr(err, pattern)
-			continue
-		}
-		globs = append(globs, g)
-	}
+	// compile and load globRepoFilter
+	globRepoFilter := newGlobRepoFilter(include, exclude, onCompile)
 
 	f := func(repo string) bool {
-		for _, g := range globs {
-			if g.Match(repo) {
-				return true
-			}
+		if !globRepoFilter.includeRepo(repo) || globRepoFilter.ignoreRepo(repo) {
+			return true
 		}
 		return false
 	}
@@ -761,10 +812,10 @@ func (s *Source) Enumerate(ctx context.Context, reporter sources.UnitReporter) e
 	}
 
 	// Otherwise, enumerate all repos.
-	ignoreRepo := buildIgnorer(s.ignoreRepos, func(err error, pattern string) {
-		ctx.Logger().Error(err, "could not compile ignore repo glob", "glob", pattern)
+	ignoreRepo := buildIgnorer(s.includeRepos, s.ignoreRepos, func(err error, pattern string) {
+		ctx.Logger().Error(err, "could not compile include/exclude repo glob", "glob", pattern)
 		// TODO: Handle error returned from UnitErr.
-		_ = reporter.UnitErr(ctx, fmt.Errorf("could not compile ignore repo glob: %w", err))
+		_ = reporter.UnitErr(ctx, fmt.Errorf("could not compile include/exclude repo glob: %w", err))
 	})
 	return s.getAllProjectRepos(ctx, apiClient, ignoreRepo, reporter)
 }

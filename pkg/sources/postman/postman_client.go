@@ -6,22 +6,17 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/source_metadatapb"
 )
 
 const (
-	GLOBAL_VARS_URL = "https://www.postman.com/_api/workspace/%s/globals"
-	//Note: This is an undocumented API endpoint. The office API endpoint keeps returning 502.
-	//We'll shift this once that behavior is resolved and stable.
-	//Official API Endpoint: "https://api.getpostman.com/workspaces/%s/global-variables"
-	//GLOBAL_VARS_URL  = "https://api.getpostman.com/workspaces/%s/global-variables"
-	WORKSPACE_URL    = "https://api.getpostman.com/workspaces/%s"
-	ENVIRONMENTS_URL = "https://api.getpostman.com/environments/%s"
-	COLLECTIONS_URL  = "https://api.getpostman.com/collections/%s"
-
-	userAgent     = "PostmanRuntime/7.26.8"
-	alt_userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	//Since we're using the undocumented API endpoint for global vars, we need a different user agent.
-	//We'll shift this once that behavior is resolved and stable.
+	WORKSPACE_URL      = "https://api.getpostman.com/workspaces/%s"
+	ENVIRONMENTS_URL   = "https://api.getpostman.com/environments/%s"
+	COLLECTIONS_URL    = "https://api.getpostman.com/collections/%s"
+	userAgent          = "PostmanRuntime/7.26.8"
 	defaultContentType = "*"
 )
 
@@ -70,10 +65,6 @@ type Environment struct {
 	VariableData `json:"environment"`
 }
 
-type GlobalVars struct {
-	VariableData `json:"data"`
-}
-
 type Metadata struct {
 	WorkspaceUUID   string
 	WorkspaceName   string
@@ -81,18 +72,16 @@ type Metadata struct {
 	EnvironmentID   string
 	CollectionInfo  Info
 	FolderID        string // UUID of the folder (but not full ID)
-	FolderName      string
+	FolderName      string // Folder path if the item is nested under one or more folders
 	RequestID       string // UUID of the request (but not full ID)
 	RequestName     string
 	FullID          string //full ID of the reference item (created_by + ID) OR just the UUID
 	Link            string //direct link to the folder (could be .json file path)
 	Type            string //folder, request, etc.
 	EnvironmentName string
-	GlobalID        string // might just be FullID, not sure
-	VarType         string
-	FieldName       string
-	FieldType       string
+	FieldType       string // Path of the item type
 	fromLocal       bool
+	LocationType    source_metadatapb.PostmanLocationType // The distinct Postman location type that the item falls under
 }
 
 type Collection struct {
@@ -122,7 +111,7 @@ type Item struct {
 	Request     Request    `json:"request,omitempty"`
 	Response    []Response `json:"response,omitempty"`
 	Description string     `json:"description,omitempty"`
-	UID         string     `json:"uid,omitempty"` //Need to use this to get the collection via API
+	UID         string     `json:"uid,omitempty"` //Need to use this to get the collection via API. The UID is a concatenation of the ID and the user ID of whoever created the item.
 }
 
 type Auth struct {
@@ -234,7 +223,7 @@ func (c *Client) NewRequest(urlStr string, headers map[string]string) (*http.Req
 	return req, nil
 }
 
-// checkResponse checks the API response for errors and returns them if present.
+// checkResponseStatus checks the API response for errors and returns them if present.
 // A Response is considered an error if it has a status code outside the 2XX range.
 func checkResponseStatus(r *http.Response) error {
 	if c := r.StatusCode; 200 <= c && c <= 299 {
@@ -262,8 +251,8 @@ func (c *Client) getPostmanReq(url string, headers map[string]string) (*http.Res
 
 // EnumerateWorkspaces returns the workspaces for a given user (both private, public, team and personal).
 // Consider adding additional flags to support filtering.
-func (c *Client) EnumerateWorkspaces() ([]Workspace, error) {
-	var workspaces []Workspace
+func (c *Client) EnumerateWorkspaces(ctx context.Context) ([]Workspace, error) {
+	ctx.Logger().V(2).Info("enumerating workspaces")
 	workspacesObj := struct {
 		Workspaces []Workspace `json:"workspaces"`
 	}{}
@@ -271,27 +260,37 @@ func (c *Client) EnumerateWorkspaces() ([]Workspace, error) {
 	r, err := c.getPostmanReq("https://api.getpostman.com/workspaces", nil)
 	if err != nil {
 		err = fmt.Errorf("could not get workspaces")
-		return workspaces, err
+		return nil, err
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		err = fmt.Errorf("could not read response body for workspaces")
-		return workspaces, err
+		return nil, err
 	}
 	r.Body.Close()
 
 	if err := json.Unmarshal([]byte(body), &workspacesObj); err != nil {
 		err = fmt.Errorf("could not unmarshal workspaces JSON")
-		return workspaces, err
+		return nil, err
+	}
+
+	for i, workspace := range workspacesObj.Workspaces {
+		tempWorkspace, err := c.GetWorkspace(ctx, workspace.ID)
+		if err != nil {
+			return nil, fmt.Errorf("could not get workspace %q (%s) during enumeration: %w", workspace.Name, workspace.ID, err)
+		}
+		workspacesObj.Workspaces[i] = tempWorkspace
+
+		ctx.Logger().V(3).Info("individual workspace getting added to the slice", "workspace", workspacesObj.Workspaces[i])
 	}
 
 	return workspacesObj.Workspaces, nil
 }
 
 // GetWorkspace returns the workspace for a given workspace
-func (c *Client) GetWorkspace(workspaceUUID string) (Workspace, error) {
-	var workspace Workspace
+func (c *Client) GetWorkspace(ctx context.Context, workspaceUUID string) (Workspace, error) {
+	ctx.Logger().V(2).Info("getting workspace", "workspace", workspaceUUID)
 	obj := struct {
 		Workspace Workspace `json:"workspace"`
 	}{}
@@ -300,49 +299,22 @@ func (c *Client) GetWorkspace(workspaceUUID string) (Workspace, error) {
 	r, err := c.getPostmanReq(url, nil)
 	if err != nil {
 		err = fmt.Errorf("could not get workspace: %s", workspaceUUID)
-		return workspace, err
+		return Workspace{}, err
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		err = fmt.Errorf("could not read response body for workspace: %s", workspaceUUID)
-		return workspace, err
+		return Workspace{}, err
 	}
 	r.Body.Close()
 
 	if err := json.Unmarshal([]byte(body), &obj); err != nil {
 		err = fmt.Errorf("could not unmarshal workspace JSON for workspace: %s", workspaceUUID)
-		return workspace, err
+		return Workspace{}, err
 	}
 
 	return obj.Workspace, nil
-}
-
-// GetGlobalVariables returns the global variables for a given workspace
-func (c *Client) GetGlobalVariables(workspace_uuid string) (VariableData, error) {
-	obj := struct {
-		VariableData VariableData `json:"data"`
-	}{}
-
-	url := fmt.Sprintf(GLOBAL_VARS_URL, workspace_uuid)
-	r, err := c.getPostmanReq(url, map[string]string{"User-Agent": alt_userAgent})
-	if err != nil {
-		err = fmt.Errorf("could not get global variables for workspace: %s", workspace_uuid)
-		return VariableData{}, err
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		err = fmt.Errorf("could not read response body for workspace: %s", workspace_uuid)
-		return VariableData{}, err
-	}
-	r.Body.Close()
-
-	if err := json.Unmarshal([]byte(body), &obj); err != nil {
-		err = fmt.Errorf("could not unmarshal global variables JSON for workspace: %s", workspace_uuid)
-		return VariableData{}, err
-	}
-	return obj.VariableData, nil
 }
 
 // GetEnvironmentVariables returns the environment variables for a given environment
